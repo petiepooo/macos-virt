@@ -1,0 +1,204 @@
+#!/bin/bash
+
+usage() {
+  echo "Usage: $0 [-c SUFF] [-h] [-l] [-r] [-u] image-basename [kernel-no]" 1>&2
+  echo "-c SUFF: clone base to base+SUFF" 1>&2
+  echo "-h: halt before running (leave mount active)" 1>&2
+  echo "-l: list kernels available for boot" 1>&2
+  echo "-r: refresh boot files from img and exit" 1>&2
+  echo "-u: update img (without this no changes are saved)" 1>&2
+  exit 1
+}
+
+while getopts "c:hlru" o; do
+    case "${o}" in
+        c)
+            CLONE=${OPTARG}
+            ;;
+        h)
+            HALT=1
+            ;;
+        l)
+            LISTONLY=1
+            ;;
+        r)
+            REFRESH=1
+            ;;
+        u)
+            UPDATE=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+#prep for ability to use this to launch VM of choice
+PREFIX="${1}"
+if [ -z "${1}" -o ! -r "${PREFIX}.img" ]; then
+  echo "ERROR: you must enter an image basename" 1>&2
+  usage
+fi
+
+if [ ! -r "${PREFIX}_boot/grub.cfg" -o "${REFRESH}" ]; then
+  # extract most current kernel/initrd from system image
+  mkdir -p "${PREFIX}_boot" "${PREFIX}_mnt"
+  echo "attaching disk image..."
+  LINES="`hdiutil attach -nomount \"${PREFIX}.img\"`"
+  if [ -z "$LINES" ]; then
+    echo "ERROR: could not attach to system drive"
+    exit 1
+  fi
+  EXT_DEV=`echo "${LINES}" | sed -n '/Linux[^_]/s/ .*//p' | head -1`
+  HDI_DEV=`echo "${LINES}" | sed -n '1s/ .*//p'`
+  echo "LINES: $LINES"
+  echo "EXT_DEV: $EXT_DEV"
+  echo "HDI_DEV: $HDI_DEV"
+  if [ -b "${EXT_DEV}" -a -b "${HDI_DEV}" ]; then
+    echo "mounting first ext2 filesystem..."
+    fuse-ext2 -o ro "${EXT_DEV}" "${PREFIX}_mnt" >/dev/null
+    sleep 0.5
+    test "${HALT}" && exit
+    ls "${PREFIX}_mnt/"
+    if [ -d "${PREFIX}_mnt/boot/" ]; then
+      cp -vr "${PREFIX}_mnt/boot/{initr*,vmlinu*,grub/grub.cfg}" "${PREFIX}_boot"
+    elif [ -d "${PREFIX}_mnt/grub/" ]; then
+      cp -vr "${PREFIX}_mnt/{initr*,vmlinu*,grub/grub.cfg}" "${PREFIX}_boot"
+    else
+      MNT_ERR=1
+    fi
+    echo "cleaning up..."
+    chmod -R u+w "${PREFIX}_boot"
+    sleep 0.2
+    diskutil unmount "${PREFIX}_mnt"
+    sleep 0.6
+    rmdir "${PREFIX}_mnt"
+    hdiutil detach "${HDI_DEV}"
+  else
+    MNT_ERR=1
+  fi
+  if [ "${MNT_ERR}" ]; then
+    echo "ERROR: could not find kernel and initrd files"
+    exit 1
+  else
+    echo "system boot directory updated"
+    exit 0
+  fi
+fi
+
+# extract root UUID to use for xhyve UUID
+ROOT_CMD="`sed -n -e '/root=/s/.*\(root=[^ ]*\) .*/\1/p' "${PREFIX}_boot/grub.cfg" | head -1`"
+RAW_UUID="`sed -n -e '/UUID=/s/.*UUID=\([^ ]*\) .*/\1/p' "${PREFIX}_boot/grub.cfg" | head -1`"
+if [ -z "${RAW_UUID}" ]; then
+  echo "ERROR: could not extract root fs UUID"
+  exit 1
+fi
+UUID="-U ${RAW_UUID}"
+
+# check if image is already in use
+HYPERKIT="/Library/Application Support/com.canonical.multipass/bin/hyperkit"
+DEV_HOST=0
+PIDS="`pgrep -f \"sudo ${HYPERKIT}\"`"
+if [ -n "$PIDS" ]; then
+  for PID in ${PIDS}; do
+    DEV_HOST=$((DEV_HOST + 2))
+
+    echo "evaluating ${PID}"
+    if ps -fp ${PID} | grep -q ${UUID}; then
+      if ps -fp ${PID} | grep -q ${PREFIX}.img.COW; then
+        echo "OK: Found existing instance with COW enabled"
+      else
+        if ps -fp ${PID} | grep -q "${PREFIX}.img"; then
+          echo "ERROR: ${PREFIX}.img appears to be mounted, cannot launch"
+          exit 1
+        else
+          echo "OK: assuming process ${PID} is UUID-clone of ${PREFIX}"
+        fi
+      fi
+    fi
+
+  done
+  echo "UUID altered:"
+  echo "${RAW_UUID}"
+  NEW_UUID="`echo ${RAW_UUID} | sed -e s/0/$DEV_HOST/`"
+  echo "${NEW_UUID}"
+  UUID="-U ${NEW_UUID}"
+fi
+
+# if listing or selecting alternate option, parse grub.cfg
+if [ ${LISTONLY} ]; then
+  grep 'menuentry ' "${PREFIX}_boot/grub.cfg" | grep -v rescue | grep -E '\.' | cut -d\' -f2 | grep -n .
+  exit
+fi
+
+# choose which kernel to boot
+if [ -z "${2}" ]; then
+  set "$2" "1"
+fi
+if [ -n "${2}" -a "${2}" -gt 0 ] 2>/dev/null; then
+  LINES="`grep 'menuentry ' "${PREFIX}_boot/grub.cfg" | grep -v rescue | grep -E '\.' | cut -d\' -f2 | grep -n .`"
+  ENTRY="`echo \"${LINES}\" | sed -n -e \"/${2}:/p\" | tr -d '()'`"
+  #echo "ENTRY: ${ENTRY}"
+  if [ -z "${ENTRY}" ]; then
+    echo "ERROR: option higher than available boot entries"
+    exit 1
+  fi
+  IS_RECOVERY="`echo \"${ENTRY}\" | grep recovery`"
+  VERSION="`echo \"${ENTRY} \" | sed -e 's/.* \([^ ]*-[^ -]*\) .*/\1/'`"
+  #echo "VERSION: ${VERSION}"
+else
+  echo "ERROR: unknown option or argument"
+  usage
+fi
+
+# set xhyve arguments
+KERNEL="${PREFIX}_boot/vmlinuz-${VERSION}"
+INITRD="${PREFIX}_boot/initrd.img-${VERSION}"
+CMDLINE="console=ttyS0 ${ROOT_CMD} ro noresume"
+if [ ! -r "${INITRD}" ]; then
+  INITRD="${PREFIX}_boot/initramfs-${VERSION}.img"
+fi
+if [ "${IS_RECOVERY}" ]; then
+  CMDLINE="${CMDLINE} recovery nomodeset"
+  echo "recovery image assumes update"
+  UPDATE=1
+fi
+
+if [ -f "${PREFIX}_boot/always_update" ]; then
+  echo "always_update flag set"
+  UPDATE=1
+fi
+
+HDD_DEV="$((DEV_HOST + 2)),virtio-blk,${PREFIX}.img"
+SUDO="exec sudo"
+if [ "${CLONE}" ]; then
+  echo "cloning image to ${PREFIX}${CLONE}.img..."
+  cp -c ${PREFIX}.img ${PREFIX}${CLONE}.img
+  HDD_DEV="$((DEV_HOST + 2)),virtio-blk,${PREFIX}${CLONE}.img"
+elif [ -z "${UPDATE}" ]; then
+  echo "Setting up temporary COW image..."
+  cp -c "${PREFIX}.img" "${PREFIX}.img.COW$$"
+  HDD_DEV="$((DEV_HOST + 2)),virtio-blk,${PREFIX}.img.COW$$"
+  SUDO="sudo"
+fi
+
+# generic xhyve parameters
+#TODO: pull specific parameters from a config file for the system
+CPU="-c 2"
+CPU="-c 1"
+MEM="-m 2G"
+
+SER_DEV="-l com1,stdio"
+PCI_DEV="-s 0:0:0,hostbridge -s 0:0:6,lpc -s 0:0:7,virtio-rnd"
+NET_DEV="-s $((DEV_HOST + 1)),virtio-net"
+MISC="-A -H -u"
+
+# start the VM
+echo RUNNING: ${SUDO} "${HYPERKIT}" $UUID $MISC $CPU $MEM $SER_DEV $PCI_DEV $NET_DEV -s "$HDD_DEV" -f "kexec,$KERNEL,$INITRD,$CMDLINE"
+test "${HALT}" && exit
+STTY="`stty -g`"
+${SUDO} "${HYPERKIT}" $UUID $MISC $CPU $MEM $SER_DEV $PCI_DEV $NET_DEV -s "$HDD_DEV" -f "kexec,$KERNEL,$INITRD,$CMDLINE"
+stty "${STTY}"
+echo "Cleaning up temporary COW image..."
+rm "${PREFIX}.img.COW$$"
