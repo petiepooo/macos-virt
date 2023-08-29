@@ -1,0 +1,113 @@
+#!/bin/bash
+
+# generic xhyve argument variables
+MEM="-m 1G"
+NET="-s 1,virtio-net,en0"
+PCI_DEV="-s 0:0:0,hostbridge -s 0:0:7,lpc"
+LPC_DEV="-l com1,stdio"
+ACPI="-A"
+
+# validate command line
+if [ -z "${1}" -o -z "${2}" ]; then
+  echo "ERROR: you must give an install ISO and system name as arguments"
+  exit 1
+elif [ ! -r "${1}" ]; then
+  echo "ERROR: cannot access ISO file"
+  exit 1
+elif echo "${2}" | grep -q ' '; then
+  echo "ERROR: system name cannot contain spaces"
+  exit 1
+fi
+
+# if HDD file does not exist, look in $3 for size
+HDD_FILE="${2}.img"
+if [ ! -r "${HDD_FILE}" ]; then
+  if [ -z "${3}" ]; then
+    echo "ERROR: system HDD file does not exist, give size as additional argument to create"
+    exit 1
+  fi
+  SIZE=${3//[kKmMgGtTbBsS]/}
+  MULT=${3//[0-9]/}
+  if [ "${3}" != "${SIZE}${MULT}" ]; then
+    echo "ERROR: malformed HDD size arg: $3"
+    exit 1
+  fi
+  if [ "${MULT}" == "S" -o "${MULT}" == "s" ]; then
+    (( SIZE = SIZE * 512 ))
+  elif [ "${MULT}" == "K" -o "${MULT}" == "k" ]; then
+    (( SIZE = SIZE * 1024 ))
+  elif [ "${MULT}" == "B" -o "${MULT}" == "b" ]; then
+    (( SIZE = SIZE * 4096 ))
+  elif [ "${MULT}" == "M" -o "${MULT}" == "m" ]; then
+    (( SIZE = SIZE * 1024 * 1024 ))
+  elif [ "${MULT}" == "G" -o "${MULT}" == "g" ]; then
+    (( SIZE = SIZE * 1024 * 1024 * 1024 ))
+  elif [ "${MULT}" == "T" -o "${MULT}" == "t" ]; then
+    (( SIZE = SIZE * 1024 * 1024 * 1024 * 1024 ))
+  fi
+  if (( SIZE % 4096 > 0 )); then
+    echo "ERROR: HDD size not multiple of 4k"
+    exit 1
+  fi
+  if (( SIZE < 16 * 1048576 )); then
+    echo "ERROR: HDD size must be 16M or larger"
+    exit 1
+  fi
+  echo "creating HDD of size ${SIZE}"
+  (( SEEK = SIZE / 1024 ))
+  dd if=/dev/zero of=${HDD_FILE} bs=1024 count=0 seek=${SEEK}
+fi
+
+# mount the install disk
+TMP_NAME="${1}.ndif.iso"
+/bin/cp -c "${1}" "${TMP_NAME}" # use -c (clonefile) so copy only uses 4k on disk
+dd if=/dev/zero "of=${TMP_NAME}" bs=2048 count=1 conv=notrunc
+hdiutil attach "${TMP_NAME}"
+sleep 0.2
+MNT_PT="`hdiutil attach \"${TMP_NAME}\" | sed -e 's~.*/Volumes/~/Volumes/~' -e 's/ /\\ /'`"
+DISK_DEV="`hdiutil attach \"${TMP_NAME}\" | sed -e 's~ .*~~'`"
+rm "${TMP_NAME}"
+if [ ! -d "${MNT_PT}" ]; then
+  echo "ERROR: unable to mount ISO?"
+  exit
+fi
+
+# create installer file links
+ln -s "${1}" inst_image.iso
+find "${MNT_PT}/casper" -name initrd -exec ln -s {} inst_initrd \; || \
+  find "${MNT_PT}/install" -name initrd.gz -exec ln -s {} inst_initrd \; || \
+  find "${MNT_PT}" -name initrd.gz -exec ln -s {} inst_initrd \;
+ln -s "${MNT_PT}"/initrd.img inst_initrd
+find "${MNT_PT}/casper" -name vmlinuz -exec ln -s {} inst_kernel \; || \
+  find "${MNT_PT}/install" -name vmlinuz -exec ln -s {} inst_kernel \; || \
+  find "${MNT_PT}" -name linux -exec ln -s {} inst_kernel \; 
+ln -s "${MNT_PT}"/vmlinuz inst_kernel
+ls -l inst_initrd inst_kernel
+
+if [ -r inst_image.iso -a -r inst_kernel -a -r inst_initrd ]; then
+  # set install-specific variables
+  IMG_CD="-s 3,ahci-cd,inst_image.iso"
+  IMG_HDD="-s 2,virtio-blk,${HDD_FILE}"
+  CMDLINE="earlyprintk=serial console=ttyS0 break=premount"
+  CMDLINE="earlyprintk=serial console=ttyS0"
+  #if [ -r "${MNT_PT}/casper" ]; then
+  #  CMDLINE="root=casper/installer.squashfs ${CMDLINE}"
+  #fi
+
+  # run the install kernel
+  echo sudo "/Library/Application Support/com.canonical.multipass/bin/hyperkit" $ACPI $MEM $PCI_DEV $LPC_DEV $NET $IMG_CD $IMG_HDD -f kexec,inst_kernel,inst_initrd,"$CMDLINE"
+  STTY=`stty -g`
+  sudo "/Library/Application Support/com.canonical.multipass/bin/hyperkit" $ACPI $MEM $PCI_DEV $LPC_DEV $NET $IMG_CD $IMG_HDD -f kexec,inst_kernel,inst_initrd,"$CMDLINE"
+  stty "${STTY}"
+else
+  echo "ERROR: could not locate required install files"
+  exit 1
+fi
+
+# cleanup install links and mount
+stty sane
+sleep 0.3
+diskutil unmount "${MNT_PT}"
+sleep 0.2
+hdiutil eject "${DISK_DEV}"
+rm -f inst_kernel inst_initrd inst_image.iso
